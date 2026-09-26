@@ -96,6 +96,15 @@
 
   .backup-bar { margin: -8px 0 18px; }
 
+  .search-bar { margin: 0 0 16px; }
+  .search-result .name { font-family: 'Source Serif 4', Georgia, serif; font-weight: 500; }
+  .edit-textarea {
+    width: 100%; min-height: 90px; resize: vertical;
+    padding: 13px 14px; font-size: 15px; line-height: 1.5; border-radius: 10px;
+    border: 1.5px solid var(--line); background: var(--surface); color: var(--ink);
+    font-family: inherit; margin-bottom: 4px;
+  }
+
   .deck-list { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
   .deck-card {
     background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
@@ -276,10 +285,20 @@
     <button class="btn ghost small" id="backupBtn">Backup &amp; Restore</button>
   </div>
 
+  <div class="search-bar">
+    <input class="text-input" id="searchInput" type="search" placeholder="Search questions and answers…" autocomplete="off" autocapitalize="off" autocorrect="off">
+  </div>
+
   <div id="deckList" class="deck-list"></div>
   <div id="emptyState" class="empty" style="display:none">
     <div class="serif">No decks yet</div>
     <div>Paste tab-separated flashcard text to create your first deck.</div>
+  </div>
+
+  <div id="searchResults" class="deck-list" style="display:none"></div>
+  <div id="searchEmptyState" class="empty" style="display:none">
+    <div class="serif">No matches</div>
+    <div id="searchEmptyText"></div>
   </div>
 </div>
 
@@ -329,6 +348,28 @@
 
     <div class="sheet-actions">
       <button class="btn ghost wide" id="closeBackupSheet">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet-backdrop" id="editCardBackdrop">
+  <div class="sheet">
+    <h2 class="serif">Edit Card</h2>
+
+    <div class="field-label">Question</div>
+    <textarea class="edit-textarea" id="editQuestionInput"></textarea>
+
+    <div class="field-label">Answer</div>
+    <textarea class="edit-textarea" id="editAnswerInput"></textarea>
+
+    <div id="editCardError" style="font-size:13.5px;margin-top:4px;color:var(--danger);font-weight:600;"></div>
+
+    <div class="sheet-actions">
+      <button class="btn ghost" id="cancelEditCard">Cancel</button>
+      <button class="btn wide" id="saveEditCard">Save</button>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn ghost wide" id="deleteEditCard" style="color:var(--danger);border-color:var(--danger);">Delete Card</button>
     </div>
   </div>
 </div>
@@ -435,6 +476,28 @@ function getAllByIndex(storeName, indexName, value) {
     const req = t.objectStore(storeName).index(indexName).getAll(value);
     req.onsuccess = () => resolve(req.result);
     req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function getRecord(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const t = tx([storeName], 'readonly');
+    const req = t.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function deleteRecord(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const t = tx([storeName], 'readwrite');
+    t.objectStore(storeName).delete(key);
+    t.oncomplete = () => resolve();
+    t.onerror = (e) => reject(e.target.error);
+  }).then(() => {
+    if (storeName === 'decks' || storeName === 'cards') {
+      return recordLastWrite(storeName);
+    }
   });
 }
 
@@ -851,6 +914,150 @@ async function exportBackup() {
 }
 
 document.getElementById('exportBackupBtn').onclick = exportBackup;
+
+// ---------- Search ----------
+// Read-only: only ever calls getAll('cards'). Never calls addRecord/deleteRecord,
+// so searching (including while typing) cannot change any card or scheduling state.
+const searchInput = document.getElementById('searchInput');
+const deckListEl = document.getElementById('deckList');
+const emptyStateEl = document.getElementById('emptyState');
+const searchResultsEl = document.getElementById('searchResults');
+const searchEmptyStateEl = document.getElementById('searchEmptyState');
+const searchEmptyText = document.getElementById('searchEmptyText');
+let searchDebounceTimer = null;
+
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(runSearch, 120);
+});
+
+async function runSearch() {
+  const rawQuery = searchInput.value.trim();
+  const query = rawQuery.toLowerCase();
+
+  if (!query) {
+    searchResultsEl.style.display = 'none';
+    searchEmptyStateEl.style.display = 'none';
+    deckListEl.style.display = '';
+    emptyStateEl.style.display = decksCache.length === 0 ? 'block' : 'none';
+    return;
+  }
+
+  const allCards = await getAll('cards');
+  const matches = allCards.filter(c =>
+    c.question.toLowerCase().includes(query) || c.answer.toLowerCase().includes(query)
+  );
+
+  deckListEl.style.display = 'none';
+  emptyStateEl.style.display = 'none';
+
+  if (matches.length === 0) {
+    searchResultsEl.style.display = 'none';
+    searchEmptyStateEl.style.display = 'block';
+    searchEmptyText.textContent = `No cards match "${rawQuery}".`;
+    return;
+  }
+
+  searchEmptyStateEl.style.display = 'none';
+  searchResultsEl.style.display = 'flex';
+  const deckNameById = Object.fromEntries(decksCache.map(d => [d.id, d.name]));
+  searchResultsEl.innerHTML = matches.map(c => {
+    const answerPreview = c.answer.length > 60 ? c.answer.slice(0, 60) + '…' : c.answer;
+    return `
+    <div class="deck-card search-result">
+      <div>
+        <div class="name">${escapeHtml(c.question)}</div>
+        <div class="meta">${escapeHtml(deckNameById[c.deckId] || 'Unknown deck')} · ${escapeHtml(answerPreview)}</div>
+      </div>
+      <div class="deck-right">
+        <button class="btn ghost small edit-btn" data-card-id="${c.id}">Edit</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  searchResultsEl.querySelectorAll('.edit-btn').forEach(btn => {
+    btn.onclick = () => openEditCard(btn.getAttribute('data-card-id'));
+  });
+}
+
+// ---------- Edit / Delete Card ----------
+const editCardBackdrop = document.getElementById('editCardBackdrop');
+const editQuestionInput = document.getElementById('editQuestionInput');
+const editAnswerInput = document.getElementById('editAnswerInput');
+const editCardError = document.getElementById('editCardError');
+let editingCardId = null;
+
+function closeEditCard() {
+  editCardBackdrop.classList.remove('open');
+  editingCardId = null;
+}
+
+async function openEditCard(cardId) {
+  const card = await getRecord('cards', cardId);
+  if (!card) { showToast('Card not found — it may have been deleted.'); return; }
+  editingCardId = cardId;
+  editQuestionInput.value = card.question;
+  editAnswerInput.value = card.answer;
+  editCardError.textContent = '';
+  editCardBackdrop.classList.add('open');
+}
+
+document.getElementById('cancelEditCard').onclick = closeEditCard;
+editCardBackdrop.onclick = (e) => { if (e.target === editCardBackdrop) closeEditCard(); };
+
+// Refreshes whichever view is currently visible (deck list, or active search
+// results) after a card is edited or deleted.
+async function afterCardChange() {
+  await refreshDeckList();
+  if (searchInput.value.trim()) {
+    await runSearch();
+  }
+}
+
+document.getElementById('saveEditCard').onclick = async () => {
+  const question = editQuestionInput.value.trim();
+  const answer = editAnswerInput.value.trim();
+  if (!question || !answer) {
+    editCardError.textContent = 'Question and answer cannot be empty.';
+    return;
+  }
+
+  // Re-read the current record and only overwrite question/answer, so every
+  // scheduling field (phase, ease, intervalDays, intervalStep, lapses, due,
+  // history) and id/deckId/createdAt are preserved exactly as-is.
+  const existing = await getRecord('cards', editingCardId);
+  if (!existing) { showToast('Card not found — it may have been deleted.'); closeEditCard(); return; }
+
+  const updated = { ...existing, question, answer };
+  await addRecord('cards', updated);
+
+  closeEditCard();
+  showToast('Card updated');
+  await afterCardChange();
+};
+
+document.getElementById('deleteEditCard').onclick = async () => {
+  if (!editingCardId) return;
+  const existing = await getRecord('cards', editingCardId);
+  if (!existing) { showToast('Card not found — it may have been deleted.'); closeEditCard(); return; }
+
+  const preview = existing.question.length > 80 ? existing.question.slice(0, 80) + '…' : existing.question;
+  const confirmed = confirm(`Delete this card permanently?\n\n"${preview}"\n\nThis cannot be undone.`);
+  if (!confirmed) return;
+
+  await deleteRecord('cards', editingCardId);
+
+  // Keep the deck's cached cardCount in sync; only this deck's count changes.
+  const deck = await getRecord('decks', existing.deckId);
+  if (deck) {
+    const newCount = Math.max(0, (deck.cardCount || 0) - 1);
+    await addRecord('decks', { ...deck, cardCount: newCount });
+  }
+
+  closeEditCard();
+  showToast('Card deleted');
+  await afterCardChange();
+};
 
 // ---------- Persistent storage request ----------
 // Asks the browser to treat this app's stored data as important and not
